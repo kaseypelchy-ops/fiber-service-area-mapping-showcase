@@ -1,632 +1,1136 @@
 # Fiber Service Area Mapping Pipeline
 
-A geospatial data-processing pipeline built to turn fiber service-area boundaries into structured, enriched address-level datasets that are ready for downstream import.
+A geospatial data-processing pipeline I built to turn fiber service-area boundaries into structured, address-level location datasets.
 
-The program takes KMZ service-area files, compares those polygon boundaries against address coordinates stored in DuckDB, enriches matched locations with Census data, then matches the resulting records against FCC Broadband Fabric data to append location-level attributes such as building type, land-use type, BSL status, and other required Fabric fields.
+The system accepts KML or KMZ network boundaries, converts the source geometry into usable service-area polygons, queries a large FCC Broadband Fabric dataset stored in DuckDB, performs exact point-in-polygon matching with Shapely, normalizes the matched location records, and generates structured JSON and CSV output for downstream use.
 
-The final result is a cleaned, validated, standardized file containing the addresses that fall inside the target fiber footprint and the additional geographic and broadband-location attributes needed by downstream systems.
+The pipeline can run automatically in Google Cloud when a new service-area file is uploaded and includes duplicate-processing protection, generation-aware locking, data-lineage metadata, optional cost-controlled geocoding fallback, and repeatable export logic.
 
-> Production source code and operational datasets are maintained privately because they contain proprietary service-area information, internal address data, licensed or restricted datasets, and company-specific import logic.
+> Production source code and operational datasets are maintained privately because they contain proprietary service-area information, internal processing logic, licensed or restricted reference data, infrastructure configuration, and company-specific output requirements.
 
 ---
 
 ## Overview
 
-Broadband service areas are often defined geographically, while marketing, sales, operations, engineering, and reporting work at the address level.
+Network service areas are usually defined geographically.
 
-That creates a practical question:
+Marketing, sales, operations, and reporting usually need to work at the address or location level.
 
-> Given a fiber construction or service-area polygon, which physical addresses fall inside it, and what geographic and FCC location attributes belong to those addresses?
+That creates a practical problem:
 
-I built this pipeline to automate that process.
+> Given a fiber construction or service-area boundary, which broadband-serviceable locations actually fall inside that footprint?
 
-Instead of manually reviewing addresses or joining several large datasets by hand, the program performs the geographic qualification, enrichment, validation, and export as one repeatable workflow.
+I built this pipeline to automate that conversion.
+
+Instead of manually comparing addresses against maps or working through large reference datasets in spreadsheets, the program takes the service-area geometry through a repeatable spatial-processing workflow and produces a structured location file.
+
+At a high level:
+
+```text
+KML / KMZ Service Area
+        ↓
+Parse Geometry
+        ↓
+Repair / Buffer / Normalize
+        ↓
+Combined Service Polygon
+        ↓
+Calculate Bounding Box
+        ↓
+Query FCC Fabric in DuckDB
+        ↓
+Stream Candidate Locations
+        ↓
+Exact Shapely Point-in-Polygon
+        ↓
+Deduplicate
+        ↓
+Normalize / Enrich
+        ↓
+Structured JSON + CSV
+```
 
 ---
 
-## What the Pipeline Does
+## What the Pipeline Handles
+
+The project includes work across:
+
+- KML and KMZ ingestion
+- XML geometry parsing
+- Polygon processing
+- MultiPolygon handling
+- Geometry validation and repair
+- LineString buffering
+- Point buffering
+- Coordinate-reference transformations
+- Service-area unioning
+- DuckDB querying
+- Bounding-box filtering
+- Batched record streaming
+- Exact point-in-polygon matching
+- FCC Broadband Fabric location extraction
+- Census geography extraction
+- Address normalization
+- Location deduplication
+- Optional reverse-geocoding fallback
+- Spatial nearest-neighbor searches
+- API cost controls
+- Cloud Storage event processing
+- Generation-aware duplicate protection
+- Processing locks
+- Stale-lock recovery
+- Output lineage tracking
+- JSON generation
+- CSV generation
+- Import-ready schema control
+
+---
+
+## Technology
+
+The pipeline uses:
+
+- Python
+- DuckDB
+- SQL
+- Shapely
+- PyProj
+- KML / KMZ
+- XML
+- FCC Broadband Fabric
+- Census geography
+- Google Cloud Storage
+- CloudEvents
+- Google Cloud Functions
+- Google Maps Geocoding API
+- JSON
+- CSV
+- Spatial indexing
+- Geospatial processing
+
+---
+
+# Core Architecture
 
 ```mermaid
 flowchart TD
-    A[KMZ Fiber Boundary] --> B[Extract KML Geometry]
-    B --> C[Normalize Polygon Geometry]
+    A[KML / KMZ Upload] --> B[Cloud Storage]
+    B --> C[Generation-Aware Worker]
 
-    D[(DuckDB Address Dataset)] --> E[Load Address Coordinates]
+    C --> D[Extract KML]
+    D --> E[Parse Geometry]
 
-    C --> F[Spatial Matching]
-    E --> F
+    E --> F[Polygon]
+    E --> G[LineString]
+    E --> H[Point]
 
-    F --> G{Address Point Inside Polygon?}
-    G -- No --> H[Exclude]
-    G -- Yes --> I[Matched Address]
+    G --> I[Projected Buffer]
+    H --> I
 
-    J[Census Data] --> K[Census Enrichment]
-    I --> K
+    F --> J[Geometry Validation / Repair]
+    I --> J
 
-    L[FCC Broadband Fabric Data] --> M[Fabric Matching / Enrichment]
-    K --> M
+    J --> K[Combined Service Area]
+    K --> L[Bounding Box]
 
-    M --> N[Append FCC Location Attributes]
-    N --> O[Building Type]
-    N --> P[Land-Use Type]
-    N --> Q[BSL Flag / Status]
-    N --> R[FCC / Fabric Identifiers & Fields]
+    M[(FCC Fabric / DuckDB)] --> N[Bounding-Box SQL Query]
+    L --> N
 
-    O --> S[Normalize & Validate]
-    P --> S
-    Q --> S
-    R --> S
+    N --> O[Stream Candidate Records]
+    O --> P[Prepared Shapely Polygon]
+    P --> Q[Exact Point-in-Polygon]
 
-    S --> T[Structured Output File]
-    T --> U[Ready for Import]
+    Q --> R[Deduplicate Locations]
+    R --> S[Normalize / Map Fields]
+    S --> T[Structured JSON]
+    S --> U[Structured CSV]
+
+    V[Optional Geocoding Fallback] --> S
 ```
 
-The result is a repeatable process for converting geographic fiber boundaries into qualified and enriched address-level data.
-
----
-
-## Data Sources
-
-The pipeline brings together four different types of data.
-
-### 1. Fiber Service-Area Geometry
-
-```text
-KMZ / KML
-    ↓
-Polygon / MultiPolygon
-```
-
-This defines the geographic footprint being evaluated.
-
-### 2. Address Inventory
+The spatial workload is deliberately split between DuckDB and Shapely.
 
 ```text
 DuckDB
-├── Location Identifier
-├── Address
-├── City
-├── State
-├── ZIP
-├── Latitude
-└── Longitude
+   ↓
+Fast Candidate Reduction
+
+Shapely
+   ↓
+Exact Geographic Decision
 ```
 
-This provides the physical address records and coordinates used for spatial matching.
+DuckDB determines which records are worth evaluating.
 
-### 3. Census Data
-
-Census reference data is used to append geographic information needed by the broader workflow.
-
-### 4. FCC Broadband Fabric Data
-
-After Census enrichment, the qualified addresses are matched against FCC Broadband Fabric data to append additional location-level attributes.
-
-The specific production fields depend on the import workflow, but examples include:
-
-- FCC / Fabric location identifier
-- Building type
-- Land-use type
-- BSL flag or status
-- Other required Fabric attributes
-
-The public showcase intentionally does not expose the production Fabric dataset or internal matching rules.
+Shapely determines whether each candidate actually falls inside the service-area geometry.
 
 ---
 
-## Problem It Solves
+# Input Geometry
 
-The source data begins in different forms:
+The pipeline accepts both:
 
 ```text
-Fiber Service Area
-    → KMZ / KML polygon
-
-Address Inventory
-    → DuckDB records with latitude / longitude
-
-Census Data
-    → Geographic reference information
-
-FCC Broadband Fabric
-    → Broadband-location attributes
+.kml
+.kmz
 ```
 
-The pipeline connects them:
+A KMZ file is opened as a ZIP archive and the contained KML document is extracted before geometry processing begins.
+
+The KML parser does not assume that every service area is represented by one clean polygon.
+
+Supported geometry can include:
 
 ```text
-Service Area Polygon
-        +
-Address Coordinates
-        +
-Census Data
-        +
-FCC Fabric Data
-        ↓
-Qualified + Enriched Address Dataset
+Polygon
+MultiPolygon
+LineString
+Point
+Multiple Placemarks
 ```
 
 ---
 
-## Core Workflow
+# Geometry Processing
 
-### 1. KMZ Ingestion
+Real-world service-area files can contain geometry that needs to be cleaned or transformed before it can be used for address qualification.
 
-The program accepts KMZ files containing fiber service-area boundaries.
+The pipeline handles each geometry type differently.
 
-KMZ files contain KML geographic data, so the first stage extracts the geometry needed for spatial processing.
+## Polygons
+
+Polygon exterior boundaries are extracted from the KML.
+
+The geometry is validated with Shapely and repaired when necessary.
 
 ```text
-KMZ
- ↓
-KML
- ↓
-Polygon / MultiPolygon
+KML Polygon
+      ↓
+Exterior Coordinates
+      ↓
+Shapely Polygon
+      ↓
+Valid?
+  /        \
+Yes         No
+ ↓           ↓
+Use      make_valid()
+             ↓
+          Use Result
 ```
 
----
-
-### 2. Polygon Processing
-
-The extracted service-area geometry is prepared for spatial comparison.
-
-The workflow can account for:
-
-- Polygon geometry
-- MultiPolygon geometry
-- Multiple service-area boundaries
-- Geographic coordinate data
-- Geometry validation
-
-The goal is to create a reliable boundary that can be compared against address points.
+If a repair produces a MultiPolygon, its polygon members can be retained individually.
 
 ---
 
-### 3. Address Data from DuckDB
+## LineStrings
 
-The address dataset is stored in DuckDB and contains location-level data including geographic coordinates.
+Some network boundaries or routes are represented as LineStrings rather than closed polygons.
 
-DuckDB makes it possible to query and process a large structured dataset without relying on spreadsheet-based workflows.
+Those paths cannot be used directly for point-in-polygon testing.
 
----
-
-### 4. Point-in-Polygon Matching
-
-Each address coordinate is treated as a geographic point.
-
-The program determines whether that point falls inside the service-area polygon.
+Instead, the workflow:
 
 ```text
-Address Latitude / Longitude
-          ↓
-     Geographic Point
-          ↓
-Compare Against Fiber Polygon
-          ↓
-      Inside?
-      /    \
-    Yes     No
-     ↓       ↓
- Include   Exclude
+LineString
+    ↓
+Transform WGS84 → Projected CRS
+    ↓
+Buffer by Distance in Meters
+    ↓
+Transform Back to WGS84
+    ↓
+Service-Area Polygon
 ```
 
-Only addresses whose coordinates fall within the target service boundary move forward.
+The LineString remains open before buffering. It is not artificially closed into a polygon ring.
 
 ---
 
-## Spatial Join
+## Points
 
-At a technical level, the workflow performs a point-in-polygon spatial join between the address dataset and the service-area geometry.
+Point geometry can also be converted into a small coverage polygon.
 
-A simplified example:
+```text
+Point
+  ↓
+Projected CRS
+  ↓
+Meter-Based Buffer
+  ↓
+WGS84 Polygon
+```
+
+---
+
+## Combined Service Area
+
+After the individual geometry pieces are normalized, they are combined into one service-area geometry.
+
+```text
+Polygon A
+    +
+Polygon B
+    +
+Buffered LineString
+    +
+Buffered Point
+    ↓
+unary_union()
+    ↓
+Combined Service Area
+```
+
+The combined result is validated again before spatial extraction begins.
+
+---
+
+# FCC Broadband Fabric Extraction
+
+The FCC Broadband Fabric dataset is stored in DuckDB and acts as the primary location source for the spatial extraction workflow.
+
+Each reference record can contain fields such as:
+
+```text
+Location ID
+Address
+City
+State
+ZIP
+Latitude
+Longitude
+Census Block GEOID
+BSL Flag
+Building Type
+Land-Use Type
+Unit Count
+Fabric Release
+Other Selected Reference Fields
+```
+
+The public repository does not include licensed Fabric records.
+
+---
+
+# Two-Stage Spatial Matching
+
+A central design decision in this pipeline is not to perform an exact geometry operation against every record in the reference dataset.
+
+Instead, matching happens in two stages.
+
+## Stage 1 — Bounding-Box Query
+
+The program calculates the service area's bounds:
+
+```text
+Minimum Longitude
+Minimum Latitude
+Maximum Longitude
+Maximum Latitude
+```
+
+DuckDB then retrieves only locations whose coordinates fall inside that rectangle.
+
+Conceptually:
 
 ```sql
 SELECT
-    address_id,
-    address_1,
+    location_id,
+    address_primary,
     city,
     state,
     zip,
     latitude,
     longitude
-FROM address_source
-WHERE ST_Within(
-    ST_Point(longitude, latitude),
-    service_area_geometry
-);
+FROM reference_locations
+WHERE latitude BETWEEN ? AND ?
+  AND longitude BETWEEN ? AND ?;
 ```
 
-This is a public example of the concept, not the production query.
+The production query also handles optional columns and source fields whose data types may vary.
 
 ---
 
-## Census Enrichment
+## Stage 2 — Exact Point-in-Polygon
 
-After an address is qualified spatially, the record is enriched with Census-related information.
+A bounding box is deliberately broader than the true service-area shape.
+
+Every candidate still needs an exact spatial test.
 
 ```text
-Matched Address
-      +
-Census Reference Data
-      ↓
-Census-Enriched Address
+DuckDB Candidate
+       ↓
+Latitude / Longitude
+       ↓
+Shapely Point
+       ↓
+Prepared Service Polygon
+       ↓
+Intersects?
+   /          \
+ No            Yes
+ ↓              ↓
+Exclude       Include
 ```
 
-This gives the address additional geographic context before the FCC Fabric matching stage.
+A prepared Shapely geometry is used for repeated spatial checks against the same service-area boundary.
+
+This gives DuckDB and Shapely separate jobs:
+
+```text
+DuckDB → Reduce the dataset quickly
+
+Shapely → Make the exact spatial decision
+```
 
 ---
 
-## FCC Broadband Fabric Enrichment
+# Batched Processing
 
-The Census-enriched records are then matched against the FCC Broadband Fabric dataset.
+The candidate query is streamed in batches.
 
-This stage adds broadband-location attributes that are not available from the KMZ boundary, address inventory, or Census data alone.
+```text
+DuckDB Query
+     ↓
+Batch 1
+     ↓
+Spatial Test
+
+Batch 2
+     ↓
+Spatial Test
+
+Batch 3
+     ↓
+Spatial Test
+```
+
+This avoids requiring the entire candidate result set to be loaded into Python memory at once.
+
+That becomes increasingly important as service-area boundaries cover larger geographic areas.
+
+---
+
+# Defensive Source Schema Handling
+
+Reference datasets can change between releases.
+
+The worker inspects the DuckDB table before building the query.
+
+Required fields such as:
+
+```text
+address_primary
+latitude
+longitude
+```
+
+must be available.
+
+Other fields can be selected conditionally.
+
+When an optional field is unavailable, the public implementation can substitute a null value instead of failing the entire extraction.
+
+The workflow also uses safe numeric conversion for coordinate fields instead of assuming every source release uses exactly the same column type.
+
+---
+
+# Location Deduplication
+
+The pipeline prefers an authoritative location identifier for deduplication.
+
+```text
+FCC / Fabric Location ID Available?
+          /             \
+        Yes              No
+         ↓                ↓
+Use Location ID      Build Address Key
+                         ↓
+                  Address + City +
+                    State + ZIP
+```
+
+Address-based deduplication is therefore a fallback rather than a replacement for an official location identifier.
+
+---
+
+# Address Normalization
+
+Address strings can vary even when they represent the same physical location.
+
+Examples:
+
+```text
+101 Sample Road
+101 SAMPLE RD
+101 Sample Rd.
+```
+
+The normalization layer performs deterministic cleanup including:
+
+```text
+Uppercasing
+Street-suffix normalization
+Punctuation cleanup
+Whitespace cleanup
+ZIP cleanup
+House-number extraction
+```
+
+The purpose is not to rewrite the source data completely.
+
+It is to create more stable comparison and export values.
+
+---
+
+# Census Geography
+
+For matched Fabric locations, Census geography can be derived from the Census block GEOID included with the source record.
+
+A standard 15-digit block GEOID can be separated into:
+
+```text
+State      → digits 1–2
+County     → digits 3–5
+Tract      → digits 6–11
+Block      → digits 12–15
+```
 
 Conceptually:
 
 ```text
-Census-Enriched Address
-        +
-FCC Broadband Fabric
+15-Digit Census Block GEOID
+            ↓
+   ┌────────┼──────────┐
+   ↓        ↓          ↓
+ State    County      Tract
+                       ↓
+                     Block
+```
+
+This keeps the geographic identifiers tied to the matched reference location.
+
+---
+
+# Optional Geocoding Fallback
+
+The primary workflow uses the reference dataset.
+
+An optional reverse-geocoding process can be enabled to inspect areas of the polygon that do not already have nearby matched reference locations.
+
+It is deliberately disabled or constrained unless needed because large-scale reverse geocoding can create substantial external API usage.
+
+The fallback works conceptually like this:
+
+```text
+Service Area
+      +
+Matched Fabric Locations
+      ↓
+Generate Sample Grid
+      ↓
+Nearest Existing Location
+      ↓
+Within Skip Radius?
+   /             \
+ Yes              No
+  ↓                ↓
+Skip         Reverse Geocode
+                   ↓
+             Valid Address?
+                   ↓
+         Coordinates Still Inside
+             Service Area?
+                   ↓
+              Deduplicate
+                   ↓
+             Add Fallback
+```
+
+---
+
+## Spatial Indexing
+
+Matched points are indexed with Shapely's `STRtree`.
+
+This allows the fallback to find the nearest existing location without comparing every sample point against every known point.
+
+```text
+Matched Locations
+       ↓
+STRtree Index
+       ↓
+Sample Point
+       ↓
+Nearest Neighbor
+       ↓
+Distance Check
+```
+
+---
+
+## Haversine Distance
+
+The nearest-location check uses great-circle distance to estimate physical separation between coordinates.
+
+This supports a configurable skip radius.
+
+If a sample point is already sufficiently close to an existing matched location, no geocoding request is made.
+
+---
+
+## Cost Controls
+
+The optional geocoding path includes several protections:
+
+- Hard maximum request count
+- Configurable sample spacing
+- Existing-location skip radius
+- Request delay
+- Polygon revalidation
+- Duplicate detection
+
+The external geocoder supplements the primary dataset rather than replacing it.
+
+---
+
+# Cloud Processing
+
+The pipeline can run as an event-driven Google Cloud worker.
+
+When a KML or KMZ file is uploaded:
+
+```text
+Cloud Storage Upload
         ↓
-Fabric-Matched Address
+CloudEvent
+        ↓
+Validate File
+        ↓
+Check Source Generation
+        ↓
+Already Completed?
+     /            \
+   Yes             No
+    ↓               ↓
+  Stop          Acquire Lock
+                    ↓
+               Run Pipeline
+                    ↓
+                 Export
 ```
-
-The output can include fields such as:
-
-```text
-FCC / Fabric Location ID
-Building Type
-Land-Use Type
-BSL Flag / Status
-Other Selected Fabric Attributes
-```
-
-This second enrichment stage is important because it turns a geographically qualified address into a record that is also aligned with FCC location-level reference data.
 
 ---
 
-## Multi-Source Enrichment
+# Source Generations
 
-The full record-building process is:
+Cloud Storage objects have immutable generations.
+
+That matters because a file can be replaced while keeping the same filename.
+
+For example:
 
 ```text
-Address Record
-     ↓
-Inside Fiber Polygon?
-     ↓
-Census Enrichment
-     ↓
-FCC Fabric Match
-     ↓
-Building / Land-Use / BSL Attributes
-     ↓
-Validated Import Record
+fiber-area.kmz
+Generation 1001
+
+fiber-area.kmz
+Generation 1047
 ```
 
-Each stage contributes a different part of the final record.
+Those are different source objects from the worker's perspective.
+
+The output metadata therefore records the exact source generation used to produce the result.
 
 ---
 
-## Data Normalization
+# Duplicate Processing Protection
 
-Before export, matched and enriched records are normalized into a consistent structure.
+Cloud Storage events can be delivered more than once.
 
-This can include:
+The worker checks whether the final output already belongs to the same source object generation before starting another run.
 
-- Address formatting
-- State formatting
-- ZIP formatting
-- Coordinate validation
-- Census identifier formatting
-- FCC / Fabric identifier formatting
-- Building-type formatting
-- Land-use formatting
-- BSL value normalization
-- Missing-value handling
-- Duplicate handling
-- Field ordering
-- Column naming
-- Data type consistency
+```text
+Storage Event
+     ↓
+Output Exists?
+     ↓
+Same Source Generation?
+   /                  \
+ Yes                   No
+  ↓                     ↓
+Stop               Continue
+```
 
-The goal is for the final file to be ready for import without another manual cleanup step.
+---
+
+# Generation-Specific Processing Locks
+
+Before running the expensive spatial workflow, the worker attempts to create a generation-specific lock using an atomic Cloud Storage operation.
+
+```text
+Worker A ──┐
+           ├── Attempt Same Lock
+Worker B ──┘
+              ↓
+       Only One Succeeds
+```
+
+The other worker exits instead of running the same extraction simultaneously.
+
+---
+
+# Stale-Lock Recovery
+
+A worker can fail unexpectedly after acquiring a lock.
+
+The lock therefore contains a start time.
+
+```text
+Existing Lock
+     ↓
+How Old?
+   /       \
+Fresh      Stale
+ ↓           ↓
+Stop       Replace
+```
+
+Generation preconditions are used when replacing the stale object so competing workers cannot both win the recovery race.
+
+---
+
+# Completion-Marker Design
+
+The pipeline produces both JSON and CSV output.
+
+The write order is deliberate.
+
+```text
+Processing Complete
+       ↓
+Write JSON
+       ↓
+Write CSV
+       ↓
+Run Considered Complete
+```
+
+The CSV is uploaded last and acts as the completion marker for the source generation.
+
+If the worker fails after JSON is written but before the CSV is produced, a future event does not incorrectly assume that the run finished successfully.
+
+---
+
+# Structured Export
+
+The public export layer uses a stable schema:
+
+```text
+location_id
+address_1
+address_2
+city
+state
+zip
+latitude
+longitude
+census_state
+census_county
+census_tract
+census_block
+bsl_flag
+building_type
+land_use_type
+unit_count
+fabric_release
+verification_source
+```
+
+Source-specific fields are mapped into this structure before serialization.
+
+Coordinates are normalized to consistent precision and Census geography is broken into explicit components.
 
 ---
 
 ## Example Output
 
-A simplified output file might look like:
+A synthetic example:
 
 ```csv
-location_id,address_1,address_2,city,state,zip,latitude,longitude,census_tract,census_block_group,census_block,fcc_location_id,building_type,land_use_type,bsl_flag,territory
-DEMO-0001,101 SAMPLE RD,,EXAMPLE,PA,00000,41.123450,-77.123450,000100,1,1000,FCC-DEMO-1001,SAMPLE_BUILDING_TYPE,SAMPLE_LAND_USE,Y,FIBER_AREA_01
-DEMO-0002,205 TEST ST,APT 2,EXAMPLE,PA,00000,41.124220,-77.121930,000100,1,1001,FCC-DEMO-1002,SAMPLE_BUILDING_TYPE,SAMPLE_LAND_USE,Y,FIBER_AREA_01
+location_id,address_1,address_2,city,state,zip,latitude,longitude,census_state,census_county,census_tract,census_block,bsl_flag,building_type,land_use_type,unit_count,fabric_release,verification_source
+DEMO-LOC-1001,101 SAMPLE RD,,EXAMPLE,PA,00000,41.1234500,-77.1234500,42,001,000100,1000,Y,SAMPLE_BUILDING_TYPE_A,SAMPLE_LAND_USE_A,1,DEMO_RELEASE,reference_polygon_match
+DEMO-LOC-1002,205 TEST ST,APT 2,EXAMPLE,PA,00000,41.1242200,-77.1219300,42,001,000100,1001,Y,SAMPLE_BUILDING_TYPE_B,SAMPLE_LAND_USE_B,2,DEMO_RELEASE,reference_polygon_match
 ```
 
-These records and values are synthetic and do not represent production addresses, FCC Fabric records, customers, or service areas.
+All values in the public sample are synthetic.
+
+Labels such as `SAMPLE_BUILDING_TYPE_A` and `SAMPLE_LAND_USE_A` are deliberately generic and should not be interpreted as official FCC classification codes.
+
+**[View the full synthetic output →](examples/sample-output.csv)**
 
 ---
 
-## Input → Processing → Output
+# Selected Engineering Decisions
 
-### Input
+## Bounding Box Before Exact Geometry
 
-```text
-KMZ fiber service-area file
-
-DuckDB address dataset
-    ├── Address information
-    ├── Latitude
-    └── Longitude
-
-Census reference data
-
-FCC Broadband Fabric data
-```
-
-### Processing
-
-```text
-Extract geometry
-        ↓
-Load address coordinates
-        ↓
-Spatial point-in-polygon match
-        ↓
-Census enrichment
-        ↓
-FCC Fabric matching
-        ↓
-Append building / land-use / BSL attributes
-        ↓
-Normalize
-        ↓
-Validate
-        ↓
-Deduplicate
-```
-
-### Output
-
-```text
-Structured, enriched address-level dataset
-ready for downstream import
-```
+A fast SQL coordinate filter reduces the candidate dataset before more expensive geometry operations begin.
 
 ---
 
-## Example Processing Summary
+## Stream Instead of Loading Everything
 
-A processing run can conceptually produce a summary like:
-
-```text
-Service polygons loaded:        2
-Address records evaluated:      250,000
-Addresses inside polygon:       8,420
-Census records matched:         8,401
-FCC Fabric records matched:     8,366
-Records requiring review:          35
-Final output records:           8,366
-```
-
-These are example numbers only.
+DuckDB results are processed in batches so large service areas do not require the full candidate set to be held in Python memory.
 
 ---
 
-## Why DuckDB
+## Repair Geometry Before Matching
 
-DuckDB works well for this project because the pipeline needs to analyze a large structured address dataset efficiently without requiring a traditional database server for each processing run.
-
-It is useful for:
-
-- Large local datasets
-- SQL-based analysis
-- Fast filtering
-- Data transformation
-- Joining structured files and tables
-- Repeatable batch processing
+Invalid polygons are repaired before they can affect the qualification result.
 
 ---
 
-## Geospatial Concepts Used
+## Buffer in a Projected CRS
 
-The project uses several geospatial concepts:
+Distance-based buffers are calculated in meters using projected coordinates rather than treating latitude/longitude degrees as physical distance.
 
-- Latitude and longitude
-- Point geometries
-- Polygon geometries
+---
+
+## Keep the Reference Dataset Primary
+
+The FCC Fabric reference dataset is the primary location source.
+
+Optional reverse geocoding is used only as a controlled fallback.
+
+---
+
+## Prefer Official Location IDs
+
+Reference location IDs are preferred for deduplication when available.
+
+Normalized address matching is a fallback.
+
+---
+
+## Control External API Cost
+
+Optional geocoding includes hard request limits, skip distances, sample spacing, and throttling.
+
+---
+
+## Track Exact Input Generations
+
+Outputs are associated with the immutable Cloud Storage generation rather than only with a filename.
+
+---
+
+## Use Atomic Processing Locks
+
+Concurrent workers cannot both successfully claim the same source generation.
+
+---
+
+## Write the Completion Artifact Last
+
+The final CSV indicates that the full processing workflow completed successfully.
+
+---
+
+# Implementation Examples
+
+The production pipeline and reference datasets remain private, but this repository includes sanitized examples based on selected implementation patterns from the system.
+
+---
+
+## KML / KMZ Geometry Processing
+
+**[View `kml-geometry-processing.py` →](examples/kml-geometry-processing.py)**
+
+Shows how KML/KMZ geometry is parsed, validated, repaired, buffered, transformed, and combined.
+
+**Demonstrates:**
+
+- KMZ extraction
+- XML namespace handling
+- Polygon processing
 - MultiPolygon handling
-- Point-in-polygon testing
-- Spatial joins
-- Service-area boundaries
-- Coordinate validation
-- Geographic enrichment
-
-The map itself is not the final product. Geography is used to create structured operational data.
+- LineString buffering
+- Point buffering
+- `make_valid`
+- PyProj transformations
+- Shapely geometry operations
 
 ---
 
-## Data Engineering View
+## DuckDB + Polygon Extraction
 
-From a data-engineering perspective, this is a multi-source geospatial ETL pipeline.
+**[View `duckdb-fabric-polygon-extract.py` →](examples/duckdb-fabric-polygon-extract.py)**
 
-### Extract
+Shows the primary reference-location extraction workflow.
 
-- KMZ / KML geometry
-- DuckDB address records
-- Census reference data
-- FCC Broadband Fabric data
+**Demonstrates:**
 
-### Transform
-
-- Parse service boundaries
-- Build geographic points
-- Perform spatial matching
-- Enrich with Census data
-- Match against FCC Fabric
-- Append FCC location attributes
-- Normalize fields
-- Validate data
-- Remove invalid or duplicate records
-
-### Load
-
-- Generate a standardized import-ready file
+- DuckDB
+- Defensive schema inspection
+- Bounding-box SQL
+- Parameterized queries
+- Batched streaming
+- Prepared geometries
+- Exact point-in-polygon
+- Location deduplication
 
 ---
 
-## Validation
+## Address Normalization
 
-Several checks happen before a record reaches the final output.
+**[View `address-normalization.py` →](examples/address-normalization.py)**
 
-### Geometry Validation
+Shows deterministic helpers for cleaning addresses and building stable comparison keys.
 
-Confirms the imported service boundary can be used for spatial processing.
+**Demonstrates:**
 
-### Coordinate Validation
-
-Confirms address records contain usable latitude and longitude values.
-
-### Address Validation
-
-Checks that required address fields are present and consistently formatted.
-
-### Census Validation
-
-Checks whether the expected Census reference information can be associated with the matched record.
-
-### FCC Fabric Validation
-
-Checks whether required FCC / Fabric attributes were matched and appended correctly.
-
-### Output Validation
-
-Checks that the final record conforms to the required import schema.
+- Street-suffix normalization
+- Match normalization
+- House-number extraction
+- ZIP cleanup
+- Safe numeric parsing
+- Canonical deduplication keys
 
 ---
 
-## Records Requiring Review
+## Cost-Controlled Geocoding Fallback
 
-Not every source record can always be processed automatically.
+**[View `cost-controlled-geocode-fallback.py` →](examples/cost-controlled-geocode-fallback.py)**
 
-Examples include:
+Shows how the optional geocoding path evaluates uncovered parts of a service area while keeping external API usage bounded.
 
-- Missing coordinates
-- Invalid coordinates
-- Incomplete addresses
-- Census mismatches
-- FCC Fabric mismatches
-- Missing required Fabric attributes
-- Duplicate records
-- Unexpected source formatting
+**Demonstrates:**
 
-Questionable records can be separated from clean output instead of being silently included.
+- Sampling grids
+- STRtree
+- Nearest-neighbor searches
+- Haversine distance
+- Skip-radius logic
+- Request caps
+- Request throttling
+- Spatial validation
 
 ---
 
-## Repeatability
+## Generation-Safe Cloud Worker
 
-The same pipeline can be reused for new fiber footprints.
+**[View `generation-safe-cloud-worker.py` →](examples/generation-safe-cloud-worker.py)**
+
+Shows the cloud-execution and duplicate-protection pattern.
+
+**Demonstrates:**
+
+- Cloud Storage generations
+- Source/output lineage
+- Atomic locks
+- Duplicate-event protection
+- Stale-lock replacement
+- Concurrent-worker protection
+- Completion markers
+
+---
+
+## Structured Export
+
+**[View `structured-export.py` →](examples/structured-export.py)**
+
+Shows how source records are transformed into a stable public-safe output structure.
+
+**Demonstrates:**
+
+- Explicit schemas
+- Census GEOID parsing
+- Reference-field mapping
+- Stable field ordering
+- JSON serialization
+- CSV generation
+
+---
+
+## Synthetic Output
+
+**[View `sample-output.csv` →](examples/sample-output.csv)**
+
+Shows the structure produced by the public export example using completely fictional records.
+
+---
+
+### More About the Examples
+
+**[View the Implementation Examples README →](examples/README.md)**
+
+The examples README explains how the individual code samples relate to the larger processing architecture.
+
+---
+
+# Data Engineering View
+
+From a data-engineering perspective, the project is a geospatial ETL pipeline.
 
 ```text
-New KMZ
+EXTRACT
    ↓
-Run Pipeline
+KML / KMZ Geometry
+FCC Fabric / DuckDB
+Optional External Geocoder
+
+TRANSFORM
    ↓
-New Qualified + Enriched Address File
+Parse Geometry
+Repair Geometry
+Build Service Area
+Bounding-Box Filter
+Point-in-Polygon Match
+Deduplicate
+Normalize
+Derive Census Geography
+Map Reference Fields
+
+LOAD
+   ↓
+Structured JSON
+Structured CSV
+Downstream Systems
 ```
 
-That removes the need to rebuild the workflow manually for every market.
+The geography is a means of creating usable structured data rather than the final product.
 
 ---
 
-## Practical Use
+# Practical Use
 
-The resulting data can support:
+The resulting location data can support work such as:
 
 - Service-area imports
 - Territory creation
-- Field-sales targeting
-- Marketing segmentation
 - Address qualification
+- Field-sales targeting
 - Direct-mail targeting
+- Marketing segmentation
 - Broadband-location analysis
-- FCC data reconciliation
+- Reference-data reconciliation
 - Market analysis
 - Operational reporting
 
-The pipeline acts as the bridge between geographic network data and address-level business workflows.
+The pipeline acts as a bridge between geographic network information and address-level business workflows.
 
 ---
 
-## Technical Documentation
+# Technical Documentation
 
 For a deeper look at the project:
 
 - **[System Architecture →](docs/architecture.md)**  
-  KMZ/KML ingestion, DuckDB data access, spatial matching, Census enrichment, FCC Fabric enrichment, validation, and export architecture.
+  Geometry ingestion, cloud processing, DuckDB access, spatial filtering, point-in-polygon matching, enrichment, validation, and export architecture.
 
 - **[Technical Overview →](docs/technical-overview.md)**  
-  Detailed implementation concepts covering spatial joins, point-in-polygon processing, geometry handling, multi-source enrichment, FCC Fabric matching, normalization, validation, batch processing, and output generation.
+  Detailed implementation concepts covering Python processing, Shapely geometry handling, DuckDB batch querying, reference-data extraction, spatial filtering, normalization, cloud reliability, and output generation.
+
+- **[Implementation Examples →](examples/README.md)**  
+  Sanitized Python examples covering geometry processing, DuckDB spatial extraction, normalization, geocoding fallback, cloud-worker reliability, and structured export.
 
 - **[Synthetic Example Output →](examples/sample-output.csv)**  
-  A public-safe example of the kind of enriched address-level file produced by the pipeline.
+  A public-safe example using fictional records and the same schema as the sanitized exporter.
 
 ---
 
-## My Role
+# My Role
 
-I designed and built the workflow to automate the conversion of fiber service-area boundaries into usable, enriched address-level data.
+I designed and built the pipeline from the original processing need through implementation and production operation.
 
 My work included:
 
-- Defining the processing workflow
-- KMZ/KML handling
-- Geographic polygon processing
+- Defining the end-to-end processing workflow
+- Python development
+- KML / KMZ ingestion
+- XML parsing
+- Shapely geometry processing
+- Geometry validation and repair
+- Coordinate-reference transformations
+- LineString and Point buffering
+- Service-area polygon construction
 - DuckDB data access
-- Coordinate-based address matching
+- SQL query design
+- Bounding-box optimization
+- Batched result processing
 - Point-in-polygon logic
-- Census data integration
-- FCC Broadband Fabric matching
-- FCC location attribute enrichment
-- Building-type and land-use field handling
-- BSL flag / status handling
-- Data cleanup and normalization
-- Validation logic
-- Output schema design
-- Import-ready file generation
-- Testing and troubleshooting
+- FCC Broadband Fabric integration
+- Census geography handling
+- Address normalization
+- Location deduplication
+- Spatial indexing
+- Optional geocoding fallback
+- API cost controls
+- Google Cloud Storage integration
+- Event-driven processing
+- Generation-aware duplicate protection
+- Processing-lock design
+- Stale-lock recovery
+- Data-lineage metadata
+- Output-schema design
+- JSON / CSV generation
+- Testing
+- Troubleshooting
+- Production support
+
+The project required both geospatial and data-engineering work: understanding how geographic service boundaries relate to large address datasets, determining how to process those datasets efficiently, and turning the resulting spatial matches into structured data that could be used by other business systems.
 
 ---
 
-## Source Code & Data
+# Source Code & Data
 
-The production source code and operational datasets remain private because they contain proprietary service-area information, internal address datasets, licensed or restricted reference data, company-specific import structures, and operational logic.
+The complete production source code and operational datasets remain private because they contain:
 
-This public repository documents the technical approach and data-processing workflow without exposing production data or proprietary implementation details.
+- Proprietary service-area information
+- Licensed or restricted FCC Broadband Fabric data
+- Internal processing configuration
+- Production storage locations
+- API credentials
+- Internal output schemas
+- Company-specific classification and import rules
+- Production infrastructure configuration
+
+This public repository is a sanitized portfolio representation of the pipeline.
+
+The documentation and implementation examples are intended to show what I built and how the system works without exposing the production environment or underlying operational datasets.
 
 ---
 
-## Summary
+# Summary
+
+The complete processing flow can be summarized as:
 
 ```text
-KMZ Fiber Boundary
-        +
-DuckDB Address Coordinates
+KML / KMZ Fiber Boundary
         ↓
-Spatial Matching
+Geometry Parsing
         ↓
-Census Enrichment
+Validation / Buffering / Repair
         ↓
-FCC Broadband Fabric Enrichment
+Combined Service Polygon
         ↓
-Building Type / Land Use / BSL / Fabric Fields
+FCC Fabric / DuckDB
         ↓
-Validation & Normalization
+Bounding-Box Candidate Reduction
         ↓
-Structured Address Output
+Exact Point-in-Polygon
         ↓
-Ready for Import
+Deduplicate Locations
+        ↓
+Normalize + Derive Geography
+        ↓
+Structured Export
+        ↓
+JSON + CSV
+        ↓
+Downstream Use
 ```
 
-What begins as a service-area polygon becomes a qualified, enriched dataset that combines address-level geography, Census information, and FCC Broadband Fabric attributes for direct use in downstream systems.
+What begins as a geographic fiber boundary becomes a repeatable address-level dataset that connects network geography with broadband-location reference data and downstream operational workflows.
