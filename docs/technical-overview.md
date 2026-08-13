@@ -1464,5 +1464,4 @@ Validation
     ↓
 Import-Ready Output
 ```
-
 The core engineering challenge is connecting multiple data formats and domains — geographic polygons, large address datasets, Census reference data, and downstream import requirements — into one repeatable and reliable workflow.
