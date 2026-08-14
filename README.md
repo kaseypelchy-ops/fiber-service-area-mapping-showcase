@@ -10,6 +10,18 @@ The pipeline can run automatically in Google Cloud when a new service-area file 
 
 ---
 
+## Project Context
+
+**Initial development:** June 2025  
+**Status:** Evolved into the current production pipeline through ongoing development  
+**Public showcase:** August 2026
+
+The project began as a simpler service-area and address-processing workflow and evolved into the current geospatial pipeline as the data, automation, and operational requirements became more sophisticated.
+
+This repository is a sanitized portfolio representation of the privately maintained production system. The public commit history reflects the creation and maintenance of this showcase, not the full development history of the production pipeline.
+
+---
+
 ## Overview
 
 Network service areas are usually defined geographically.
