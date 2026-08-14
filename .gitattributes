@@ -1,0 +1,3 @@
+# Include public implementation examples in GitHub Linguist statistics.
+
+examples/*.py -linguist-documentation linguist-detectable=true
